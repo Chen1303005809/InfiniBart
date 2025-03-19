@@ -38,6 +38,8 @@ class InfiniAttention(nn.Module):
         self.n_heads = config.encoder_attention_heads
         self.head_dim = self.d_model // self.n_heads
         self.layer_idx = layer_idx
+        self.d_key = config.d_model // config.encoder_attention_heads
+        self.d_value = config.d_model // config.encoder_attention_heads
         
         # 初始化查询、键、值投影
         self.q_proj = nn.Linear(self.d_model, self.d_model)
@@ -51,8 +53,8 @@ class InfiniAttention(nn.Module):
         # 内存参数（每层独立）， 两个不可训练的内存块，用于存储信息 
         # self.memory_matrix = nn.Parameter(torch.zeros(1, self.n_heads, self.head_dim, self.head_dim))
         # self.memory_norm = nn.Parameter(torch.zeros(1, self.n_heads, self.head_dim))
-        self.register_buffer("z", torch.zeros(1, self.n_heads, self.head_dim))
-        self.register_buffer("M", torch.zeros(1, self.n_heads, self.head_dim, self.head_dim))
+        self.register_buffer("M", torch.zeros( self.n_heads, self.d_key, self.d_value))
+        self.register_buffer("z", torch.zeros(self.n_heads, self.d_key))
         
         # 可训练门控参数
         self.gate_alpha = nn.Parameter(torch.tensor(0.5))  # 初始融合权重
@@ -62,24 +64,24 @@ class InfiniAttention(nn.Module):
         # K: [batch, n_heads, seq_len, head_dim]
         # V: [batch, n_heads, seq_len, head_dim]
         sigma_K = torch.nn.functional.elu(K) + 1
-        self.M += torch.einsum('bhd,bhv->dhv', sigma_K, V)
+        self.M += torch.einsum('bhkd,bhvd->hkv', sigma_K, V)
         self.z += sigma_K.sum(dim=(0,1), keepdim=True)
         
-    def forward(self, hidden_states: torch.Tensor, output_attentions, attention_mask: torch.Tensor = None, layer_head_mask = None, ):
+    def forward(self, hidden_states: torch.Tensor, output_attentions = False, attention_mask: torch.Tensor = None, layer_head_mask = None, ):
         batch_size, seq_len, _ = hidden_states.shape
         
-        # 投影到查询、键、值空间  K, V 为从原始文本中获取到的信息,k,v是从扰动文本中获取的信息
-        q = self.q_proj(hidden_states).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)  # [B, H, L, D]
-        k = self.k_proj(hidden_states).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2)
+        # 投影到查询、键、值空间
+        q = self.q_proj(hidden_states).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2) # [Batch, Head, QLen, Dim]
+        k = self.k_proj(hidden_states).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2) # [Batch, Head, KLen, Dim]
+        v = self.v_proj(hidden_states).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2) # [Batch, Head, VLen, Dim]
         
         # ========== 相对位置编码 ==========
-        rel_pos = self.rel_pos_enc(seq_len, seq_len, hidden_states.device)  # [L, L, D]
-        rel_pos = rel_pos.unsqueeze(0).unsqueeze(1)  # [1, 1, L, L, D]
+        rel_pos = self.rel_pos_enc(seq_len, seq_len, hidden_states.device)  # R = [QL, KL, D]
         
-        # 将位置信息融入注意力计算
-        q_with_pos = q.unsqueeze(3) + rel_pos  # [B, H, L, L, D]
-        attn_scores = torch.einsum("bhqld,bhkld->bhqlk", q_with_pos, k.unsqueeze(2)) / (self.head_dim ** 0.5)
+        # 将位置信息融入注意力计算  A_rel = softmax((Q * trans(K) + Q * trans(R)) / sqrt(d))  这里可以选择用μ等训练标量来修正一部分K和R
+        attn_scores = torch.einsum("bhqd,bhkd->bhqk", q, k) 
+        QR_term = torch.einsum("bhqd,qkd->bhqk", q, rel_pos) 
+        attn_scores = (attn_scores + QR_term) / (self.head_dim ** 0.5)
         
         # 应用注意力掩码
         if attention_mask is not None:
@@ -87,12 +89,11 @@ class InfiniAttention(nn.Module):
             
         # 局部注意力权重
         local_attn_weights = torch.softmax(attn_scores, dim=-1)  # [B, H, L, L]
-        local_context = torch.einsum("bhqlk,bhkvd->bhqvd", local_attn_weights, v)  # [B, H, L, D]
+        local_context = torch.einsum("bhqk,bhkd->bhqd", local_attn_weights, v)  # [B, H, L, D]
         
         # ========== 全局内存检索 ==========
         sigma_Q = torch.nn.functional.elu(q) + 1
-        global_attn = torch.einsum("bhld,bhdk->bhlk", sigma_Q, self.M) / (torch.einsum("bhld,bhd->bhl", sigma_Q, self.z) + 1e-6)
-        global_attn = global_attn.transpose(1, 2)  # [B, L, H, D]
+        global_attn = torch.einsum("bhqk,hkv->bhqv", sigma_Q, self.M) / (torch.einsum("bhqk,hk->bhq", sigma_Q, self.z) + 1e-6).unsqueeze(-1)
         
         # ========== 门控融合 ==========
         gate = torch.sigmoid(self.gate_alpha)
@@ -101,6 +102,7 @@ class InfiniAttention(nn.Module):
         # 合并多头输出
         output = combined.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         output = self.out_proj(output)
-    
-            
+
+        if output_attentions:
+            return output, local_attn_weights, _
         return output
