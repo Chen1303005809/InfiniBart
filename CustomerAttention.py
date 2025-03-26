@@ -53,7 +53,8 @@ class InfiniAttention(nn.Module):
         # 内存参数（每层独立）， 两个不可训练的内存块，用于存储信息 
         # self.memory_matrix = nn.Parameter(torch.zeros(1, self.n_heads, self.head_dim, self.head_dim))
         # self.memory_norm = nn.Parameter(torch.zeros(1, self.n_heads, self.head_dim))
-        self.register_buffer("M", torch.zeros( self.n_heads, self.d_key, self.d_value))
+
+        self.register_buffer("M", torch.zeros(self.n_heads, self.d_key, self.d_value))
         self.register_buffer("z", torch.zeros(self.n_heads, self.d_key))
         
         # 可训练门控参数
@@ -63,11 +64,12 @@ class InfiniAttention(nn.Module):
         """更新全局内存矩阵"""
         # K: [batch, n_heads, seq_len, head_dim]
         # V: [batch, n_heads, seq_len, head_dim]
+        # 已在BART类中修改，故K与V均为4维， 
         sigma_K = torch.nn.functional.elu(K) + 1
-        self.M += torch.einsum('bhkd,bhvd->hkv', sigma_K, V)
-        self.z += sigma_K.sum(dim=(0,1), keepdim=True)
+        self.M += torch.einsum('bhnk,bhnv->bhkv', sigma_K, V).sum(dim=0)  # kd * （vd）^T = kv
+        self.z += sigma_K.sum(dim=(0, 2))
         
-    def forward(self, hidden_states: torch.Tensor, output_attentions = False, attention_mask: torch.Tensor = None, layer_head_mask = None, ):
+    def forward(self, hidden_states: torch.Tensor, output_attentions = None, attention_mask: torch.Tensor = None, layer_head_mask = None, ):
         batch_size, seq_len, _ = hidden_states.shape
         
         # 投影到查询、键、值空间
@@ -93,7 +95,7 @@ class InfiniAttention(nn.Module):
         
         # ========== 全局内存检索 ==========
         sigma_Q = torch.nn.functional.elu(q) + 1
-        global_attn = torch.einsum("bhqk,hkv->bhqv", sigma_Q, self.M) / (torch.einsum("bhqk,hk->bhq", sigma_Q, self.z) + 1e-6).unsqueeze(-1)
+        global_attn = torch.einsum("bhqk,hkv->bhqv", sigma_Q, self.M) / (torch.einsum("bhqk,hk->bhqk", sigma_Q, self.z) + 1e-6)
         
         # ========== 门控融合 ==========
         gate = torch.sigmoid(self.gate_alpha)
@@ -103,6 +105,6 @@ class InfiniAttention(nn.Module):
         output = combined.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         output = self.out_proj(output)
 
-        if output_attentions:
-            return output, local_attn_weights, _
-        return output
+        # if output_attentions:
+        #     return output, local_attn_weights, _
+        return output, local_attn_weights, _
