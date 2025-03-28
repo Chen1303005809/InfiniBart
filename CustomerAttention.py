@@ -6,7 +6,7 @@ from transformers import  BartConfig
 
 class RelativePositionEncoding(nn.Module):
     """Transformer-XL风格的相对位置编码"""
-    def __init__(self, d_model: int, max_rel_pos: int = 512):
+    def __init__(self, d_model: int, max_rel_pos: int = 1024):
         super().__init__()
         self.d_model = d_model
         self.max_rel_pos = max_rel_pos
