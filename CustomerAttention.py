@@ -4,32 +4,65 @@ import torch.nn.functional as F
 import math
 from transformers import  BartConfig
 
-class RelativePositionEncoding(nn.Module):
-    """Transformer-XL风格的相对位置编码"""
-    def __init__(self, d_model: int, max_rel_pos: int = 1024):
+import torch
+import torch.nn as nn
+import math
+
+class RotaryPositionEmbedding(nn.Module):
+    def __init__(self, dim, max_seq_len=512):
         super().__init__()
-        self.d_model = d_model
-        self.max_rel_pos = max_rel_pos
-        # 相对位置编码矩阵 [2*max_rel_pos+1, d_model]
-        self.emb = nn.Embedding(2 * max_rel_pos + 1, d_model)
+        assert dim % 2 == 0, "Dimension must be even for rotary positional encoding"
         
-    def forward(self, q_len: int, k_len: int, device: torch.device):
-        """生成相对位置索引矩阵
-        Args:
-            q_len: 查询序列长度
-            k_len: 键序列长度
-        Returns:
-            rel_pos: [q_len, k_len, d_model]
+        self.dim = dim
+        self.max_seq_len = max_seq_len
+        
+        # 计算频率倒数 (公式: 10000^(-2j/d) for j in [0, d//2 - 1])
+        theta = torch.arange(0, self.dim, 2).float() / self.dim
+        theta = 10000.0 ** (-theta)
+        
+        # 生成位置编码
+        pos = torch.arange(max_seq_len).float()
+        
+        # 创建角度矩阵 (外积: pos * theta)
+        angle = torch.einsum('n,d->nd', pos, theta)
+        
+        # 缓存cos和sin值
+        cos = torch.cos(angle)
+        sin = torch.sin(angle)
+        
+        self.register_buffer('cos', cos, persistent=False)
+        self.register_buffer('sin', sin, persistent=False)
+    
+    def forward(self, q, k):
         """
-        range_q = torch.arange(q_len, device=device)[:, None]  # [q_len, 1]
-        range_k = torch.arange(k_len, device=device)[None, :]  # [1, k_len]
-        distance = range_q - range_k  # [q_len, k_len]
+        Args:
+            q: query tensor (batch_size, n_heads, seq_len, head_dim)
+            k: key tensor   (batch_size, n_heads, seq_len, head_dim)
         
-        # 限制在[-max_rel_pos, max_rel_pos]范围内
-        distance = torch.clamp(distance, -self.max_rel_pos, self.max_rel_pos)
-        distance += self.max_rel_pos  # 映射到[0, 2*max_rel_pos]
+        Returns:
+            旋转后的query和key（保持原始维度顺序）
+        """
+        batch_size, n_heads, seq_len, head_dim = q.shape
+        assert head_dim == self.dim, f"Head dimension must be {self.dim}"
         
-        return self.emb(distance)  # [q_len, k_len, d_model]
+        # 获取对应序列位置的编码
+        cos = self.cos[:seq_len]  # (seq_len, dim//2)
+        sin = self.sin[:seq_len]  # (seq_len, dim//2)
+        
+        # 调整维度用于广播 (batch_size=1, n_heads=1, seq_len, dim//2)
+        cos = cos.view(1, 1, seq_len, -1)  # 新维度顺序 [1, 1, L, D/2]
+        sin = sin.view(1, 1, seq_len, -1)
+        
+        # 分割最后维度为复数对
+        def rotate_half(x):
+            x1, x2 = x.chunk(2, dim=-1)
+            return torch.cat((-x2, x1), dim=-1)
+        
+        # 更高效的实现方式（避免显式reshape）
+        q_rot = q * cos + rotate_half(q) * sin
+        k_rot = k * cos + rotate_half(k) * sin
+        
+        return q_rot, k_rot
 
 class InfiniAttention(nn.Module):
     def __init__(self, config: BartConfig, layer_idx: int):
@@ -48,7 +81,7 @@ class InfiniAttention(nn.Module):
         self.out_proj = nn.Linear(self.d_model, self.d_model)
         
         # 相对位置编码组件
-        self.rel_pos_enc = RelativePositionEncoding(self.head_dim, max_rel_pos=1024)
+        self.rel_pos_enc = RotaryPositionEmbedding(self.head_dim, max_rel_pos=4096)
         
         # 内存参数（每层独立）， 两个不可训练的内存块，用于存储信息 
         # self.memory_matrix = nn.Parameter(torch.zeros(1, self.n_heads, self.head_dim, self.head_dim))
@@ -77,13 +110,11 @@ class InfiniAttention(nn.Module):
         k = self.k_proj(hidden_states).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2) # [Batch, Head, KLen, Dim]
         v = self.v_proj(hidden_states).view(batch_size, seq_len, self.n_heads, self.head_dim).transpose(1, 2) # [Batch, Head, VLen, Dim]
         
-        # ========== 相对位置编码 ==========
-        rel_pos = self.rel_pos_enc(seq_len, seq_len, hidden_states.device)  # R = [QL, KL, D]
+        # 注入RoPE相对位置编码
+        q, k = self.rel_pos_enc(q, k) 
         
-        # 将位置信息融入注意力计算  A_rel = softmax((Q * trans(K) + Q * trans(R)) / sqrt(d))  这里可以选择用μ等训练标量来修正一部分K和R
         attn_scores = torch.einsum("bhqd,bhkd->bhqk", q, k) 
-        QR_term = torch.einsum("bhqd,qkd->bhqk", q, rel_pos) 
-        attn_scores = (attn_scores + QR_term) / (self.head_dim ** 0.5)
+        attn_scores = (attn_scores) / (self.head_dim ** 0.5)
         
         # 应用注意力掩码
         if attention_mask is not None:
