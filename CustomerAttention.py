@@ -81,7 +81,7 @@ class InfiniAttention(nn.Module):
         self.out_proj = nn.Linear(self.d_model, self.d_model)
         
         # 相对位置编码组件
-        self.rel_pos_enc = RotaryPositionEmbedding(self.head_dim, max_rel_pos=4096)
+        self.rel_pos_enc = RotaryPositionEmbedding(self.head_dim, max_seq_len=4096)
         
         # 内存参数（每层独立）， 两个不可训练的内存块，用于存储信息 
         # self.memory_matrix = nn.Parameter(torch.zeros(1, self.n_heads, self.head_dim, self.head_dim))
